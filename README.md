@@ -23,7 +23,7 @@ effectively zero CPU and GPU, so it stays out of the way of your games.
 - Day and night brightness on a schedule: 85% by day, 65% at night, fading over 30 minutes
 - A slight warm night light at night (5500 K), applied by the graphics card at zero cost
 - Games get their own look: any fullscreen app counts as a game and gets 100% brightness,
-  65% contrast and no night light — only on the monitor the game is on
+  65% contrast and a lighter night light — only on the monitor the game is on
 - When you leave the game, everything goes back to the schedule (and your old contrast)
 - Mark any app as a game, or never a game, from the tray menu ("Treat app.exe as a game"),
   or give an app its own brightness, contrast and volume in the settings file
@@ -56,7 +56,12 @@ and turn on **DDC/CI** (sometimes under "Other" or "System"), then choose
 
 ## Settings
 
-Choose **Edit settings…** in the tray menu. It opens `%APPDATA%\Grovekeeper\config.ini`:
+Choose **Settings…** in the tray menu, or start `grovekeeper.exe` again while it's running.
+The settings window has switches, sliders and steppers for everything below; each change
+is saved and applied immediately. Recently used apps can be added as games with one click.
+
+Everything is stored in `%APPDATA%\Grovekeeper\config.ini`, which you can also edit by hand
+(**Open settings file** in the settings window):
 
 ```ini
 # How much the brightness hotkeys change brightness, in percent.
@@ -91,7 +96,7 @@ night_light = 5500        # kelvin; 6500 = off, lower = warmer
 fullscreen_is_game = true
 brightness = 100
 contrast = 65
-night_light_in_games = false
+night_light = 6000        # lighter night light while gaming
 not_games = chrome.exe, msedge.exe, firefox.exe, vlc.exe
 
 [app valorant-win64-shipping.exe]

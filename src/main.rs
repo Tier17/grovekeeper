@@ -5,6 +5,7 @@ mod autostart;
 mod config;
 mod ddc;
 mod icon;
+mod settings;
 mod ui;
 mod util;
 mod worker;
@@ -37,7 +38,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_END, VK_ESCAPE, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -51,6 +52,9 @@ use worker::{from_percent, Cmd, Shared, Snapshot};
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_REFRESHED: u32 = WM_APP + 2;
 const WM_APP_FOREGROUND: u32 = WM_APP + 3;
+/// Sent by a second copy of the exe: starting Grovekeeper again opens its settings.
+const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 4;
+const PANEL_CLASS: &str = "GrovekeeperPanel";
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWCP_ROUNDSMALL: i32 = 3;
@@ -101,6 +105,8 @@ struct App {
     taskbar_created: u32,
     own_pid: u32,
     auto: AutoState,
+    /// Apps used recently, newest first, offered in the settings window.
+    recent: Vec<String>,
 }
 
 #[derive(Default)]
@@ -126,6 +132,15 @@ impl App {
 
     /// Works out what every monitor should be set to right now and sends only what changed.
     fn evaluate(&mut self, force_night_light: bool) {
+        let detected = auto::detect_foreground(self.own_pid);
+        if let Some(exe) = detected.as_ref().map(|fg| fg.exe.clone()) {
+            if !exe.is_empty() && !auto::is_system_app(&exe) {
+                self.recent.retain(|e| *e != exe);
+                self.recent.insert(0, exe);
+                self.recent.truncate(8);
+            }
+        }
+
         if !self.config.auto_enabled {
             if self.auto.active {
                 for device in ddc::display_devices() {
@@ -138,7 +153,7 @@ impl App {
         }
         self.auto.active = true;
 
-        if let Some(fg) = auto::detect_foreground(self.own_pid) {
+        if let Some(fg) = detected {
             self.auto.foreground = Some(fg);
         }
         let profile = self.auto.foreground.as_ref().and_then(|fg| auto::resolve(&self.config, fg));
@@ -181,11 +196,7 @@ impl App {
 
         for device in ddc::display_devices() {
             let in_game = profile.as_ref().is_some_and(|p| p.game && (p.device.is_empty() || p.device == device));
-            let kelvin = if in_game && !self.config.games.night_light_in_games {
-                auto::NEUTRAL_KELVIN
-            } else {
-                base.kelvin
-            };
+            let kelvin = if in_game { base.kelvin.max(self.config.games.night_light) } else { base.kelvin };
             let changed = self.auto.kelvin.get(&device) != Some(&kelvin);
             if changed || (force_night_light && kelvin < auto::NEUTRAL_KELVIN) {
                 auto::set_night_light(&device, kelvin);
@@ -255,12 +266,17 @@ fn main() {
         let mutex_name = wide("Local\\Grovekeeper.SingleInstance");
         let _mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            let running = FindWindowW(wide(PANEL_CLASS).as_ptr(), null());
+            if !running.is_null() {
+                AllowSetForegroundWindow(ASFW_ANY);
+                PostMessageW(running, WM_APP_OPEN_SETTINGS, 0, 0);
+            }
             return;
         }
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let instance = GetModuleHandleW(null());
-        let class_name = wide("GrovekeeperPanel");
+        let class_name = wide(PANEL_CLASS);
         let mut wc: WNDCLASSEXW = zeroed();
         wc.cbSize = size_of::<WNDCLASSEXW>() as u32;
         wc.style = CS_DROPSHADOW;
@@ -269,6 +285,7 @@ fn main() {
         wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
         wc.lpszClassName = class_name.as_ptr();
         RegisterClassExW(&wc);
+        settings::register(instance);
 
         let title = wide("Grovekeeper");
         let hwnd = CreateWindowExW(
@@ -318,6 +335,7 @@ fn main() {
                 taskbar_created,
                 own_pid: GetCurrentProcessId(),
                 auto: AutoState::default(),
+                recent: Vec::new(),
             })
         });
 
@@ -397,6 +415,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if updated && IsWindowVisible(hwnd) != 0 {
                 place_panel(hwnd, false);
             }
+            0
+        }
+        WM_APP_OPEN_SETTINGS => {
+            settings::open();
             0
         }
         WM_APP_FOREGROUND => {
@@ -694,7 +716,7 @@ unsafe fn show_menu(hwnd: HWND) {
     append(menu, MF_SEPARATOR, 0, "");
     let autostart = if autostart::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
     append(menu, MF_STRING | autostart, ID_AUTOSTART, "Start with Windows");
-    append(menu, MF_STRING, ID_SETTINGS, "Edit settings…");
+    append(menu, MF_STRING, ID_SETTINGS, "Settings…");
     append(menu, MF_SEPARATOR, 0, "");
     append(menu, MF_STRING, ID_EXIT, "Exit");
 
@@ -743,12 +765,7 @@ unsafe fn run_command(hwnd: HWND, cmd: usize) {
                 a.evaluate(false);
             });
         }
-        ID_SETTINGS => {
-            config::ensure_exists();
-            let file = wide(&config::path().to_string_lossy());
-            let verb = wide("open");
-            ShellExecuteW(hwnd, verb.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL);
-        }
+        ID_SETTINGS => settings::open(),
         c if (ID_PRESET..ID_MONITOR).contains(&c) => {
             with_app(|a| {
                 let Some(preset) = a.config.presets.get(c - ID_PRESET) else { return };

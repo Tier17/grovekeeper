@@ -54,7 +54,9 @@ night_light = 5500
 fullscreen_is_game = true
 brightness = 100
 contrast = 65
-night_light_in_games = false
+# A lighter night light while gaming, in kelvin. Never warmer than the normal
+# night light, and off in the daytime. 6500 = no night light in games.
+night_light = 6000
 # Fullscreen apps that are not games (videos, browsers).
 not_games = chrome.exe, msedge.exe, firefox.exe, brave.exe, opera.exe, vlc.exe, mpc-hc64.exe, potplayermini64.exe, netflix.exe, powerpnt.exe
 
@@ -93,7 +95,8 @@ pub struct Games {
     pub fullscreen_is_game: bool,
     /// Indexed like `ddc::FEATURES`, in percent.
     pub values: [Option<u32>; 3],
-    pub night_light_in_games: bool,
+    /// Kelvin while a game is in front. 6500 means no tint.
+    pub night_light: u32,
     pub not_games: Vec<String>,
 }
 
@@ -176,7 +179,7 @@ fn parse(text: &str) -> Config {
         games: Games {
             fullscreen_is_game: true,
             values: [Some(100), Some(65), None],
-            night_light_in_games: false,
+            night_light: 6000,
             not_games: Vec::new(),
         },
         apps: Vec::new(),
@@ -220,11 +223,7 @@ fn parse(text: &str) -> Config {
                     "night_brightness" => s.night_brightness = percent(value).unwrap_or(s.night_brightness),
                     "day_contrast" => s.day_contrast = percent(value),
                     "night_contrast" => s.night_contrast = percent(value),
-                    "night_light" => {
-                        s.night_light = value.trim_end_matches(['k', 'K']).trim().parse::<u32>()
-                            .map(|k| k.clamp(3000, 6500))
-                            .unwrap_or(s.night_light)
-                    }
+                    "night_light" => s.night_light = kelvin(value).unwrap_or(s.night_light),
                     _ => {}
                 }
             }
@@ -232,7 +231,7 @@ fn parse(text: &str) -> Config {
                 let g = &mut config.games;
                 match key.as_str() {
                     "fullscreen_is_game" => g.fullscreen_is_game = boolean(value).unwrap_or(g.fullscreen_is_game),
-                    "night_light_in_games" => g.night_light_in_games = boolean(value).unwrap_or(g.night_light_in_games),
+                    "night_light" => g.night_light = kelvin(value).unwrap_or(g.night_light),
                     "not_games" => {
                         g.not_games = value
                             .split(',')
@@ -298,6 +297,10 @@ fn percent(value: &str) -> Option<u32> {
     value.trim_end_matches('%').trim().parse::<u32>().ok().map(|v| v.min(100))
 }
 
+fn kelvin(value: &str) -> Option<u32> {
+    value.trim_end_matches(['k', 'K']).trim().parse::<u32>().ok().map(|k| k.clamp(3000, 6500))
+}
+
 fn boolean(value: &str) -> Option<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
@@ -313,47 +316,87 @@ fn clock(value: &str) -> Option<u32> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
-/// Sets `key = value` inside `[section]`, adding the key or the section when missing.
-/// Keeps every other line (and comment) of the file as it is.
+/// Sets `key = value` inside `[section]` (an empty section means the top of the file),
+/// adding the key or the section when missing. Every other line and comment stays as it is.
 pub fn set_value(section: &str, key: &str, value: &str) {
+    edit_file(|text| with_value(text, section, key, value));
+}
+
+/// Deletes `[section]` and its lines from the file.
+pub fn remove_section(section: &str) {
+    edit_file(|text| without_section(text, section));
+}
+
+fn edit_file(edit: impl FnOnce(&str) -> String) {
     ensure_exists();
     let path = path();
-    let Ok(text) = fs::read_to_string(&path) else { return };
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if let Ok(text) = fs::read_to_string(&path) {
+        let _ = fs::write(&path, edit(&text));
+    }
+}
 
-    let header = |l: &str| {
-        l.trim()
-            .strip_prefix('[')
-            .and_then(|l| l.strip_suffix(']'))
-            .map(|s| s.trim().to_ascii_lowercase())
+fn header(line: &str) -> Option<String> {
+    line.trim()
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(']'))
+        .map(|s| s.trim().to_ascii_lowercase())
+}
+
+/// Line range of a section's body: (index of its first line after the header, end index).
+fn section_body(lines: &[String], section: &str) -> Option<(usize, usize)> {
+    let start = if section.is_empty() {
+        0
+    } else {
+        let wanted = section.to_ascii_lowercase();
+        lines.iter().position(|l| header(l).as_deref() == Some(wanted.as_str()))? + 1
     };
-    let wanted = section.to_ascii_lowercase();
-    let new_line = format!("{key} = {value}");
+    let end = lines[start..].iter().position(|l| header(l).is_some()).map_or(lines.len(), |i| start + i);
+    Some((start, end))
+}
 
-    match lines.iter().position(|l| header(l).as_deref() == Some(wanted.as_str())) {
-        Some(start) => {
-            let end = lines[start + 1..]
-                .iter()
-                .position(|l| header(l).is_some())
-                .map(|i| start + 1 + i)
-                .unwrap_or(lines.len());
-            let existing = (start + 1..end).find(|&i| {
-                lines[i]
-                    .split_once('=')
-                    .is_some_and(|(k, _)| !lines[i].trim_start().starts_with('#') && k.trim().eq_ignore_ascii_case(key))
+fn with_value(text: &str, section: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let new_line = format!("{key} = {value}");
+    match section_body(&lines, section) {
+        Some((start, end)) => {
+            let existing = (start..end).find(|&i| {
+                let line = lines[i].trim_start();
+                !line.starts_with('#')
+                    && line.split_once('=').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
             });
             match existing {
                 Some(i) => lines[i] = new_line,
-                None => lines.insert(start + 1, new_line),
+                None if section.is_empty() => {
+                    let at = (start..end).rev().find(|&i| !lines[i].trim().is_empty()).map_or(start, |i| i + 1);
+                    lines.insert(at, new_line);
+                }
+                None => lines.insert(start, new_line),
             }
         }
         None => {
-            lines.push(String::new());
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
             lines.push(format!("[{section}]"));
             lines.push(new_line);
         }
     }
-    let _ = fs::write(&path, lines.join("\n") + "\n");
+    lines.join("\n") + "\n"
+}
+
+fn without_section(text: &str, section: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if section.is_empty() {
+        return text.to_string();
+    }
+    if let Some((start, end)) = section_body(&lines, section) {
+        let mut from = start - 1;
+        while from > 0 && lines[from - 1].trim().is_empty() {
+            from -= 1;
+        }
+        lines.drain(from..end);
+    }
+    lines.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -378,5 +421,27 @@ mod tests {
         let c = parse("[app Valorant.exe]\ngame = true\n[app vlc.exe]\nbrightness = 70%\n");
         assert_eq!(c.app_is_game("valorant.exe"), Some(true));
         assert_eq!(c.apps[1].values[0], Some(70));
+    }
+
+    #[test]
+    fn games_night_light() {
+        let c = parse(&format!("{DEFAULT_BASIC}{DEFAULT_AUTO}"));
+        assert_eq!(c.games.night_light, 6000);
+        assert_eq!(parse("[games]\nnight_light = 6200\n").games.night_light, 6200);
+    }
+
+    #[test]
+    fn editing_keeps_the_rest() {
+        let text = "# top\nstep = 10\n\n[auto]\nenabled = true\n# note\nday_brightness = 85\n\n[app a.exe]\ngame = true\n";
+        let t = with_value(text, "auto", "day_brightness", "90");
+        assert!(t.contains("day_brightness = 90") && !t.contains("= 85") && t.contains("# note"));
+        let t = with_value(&t, "", "step", "15");
+        assert!(t.starts_with("# top\nstep = 15\n"));
+        let t = with_value(&t, "app b.exe", "game", "false");
+        assert!(t.ends_with("[app b.exe]\ngame = false\n"));
+        let t = without_section(&t, "app a.exe");
+        assert!(!t.contains("a.exe") && t.contains("[app b.exe]") && t.contains("day_brightness = 90"));
+        let c = parse(&t);
+        assert_eq!((c.step, c.schedule.day_brightness, c.app_is_game("b.exe")), (15, 90, Some(false)));
     }
 }

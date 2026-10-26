@@ -124,6 +124,23 @@ fn process_name(pid: u32) -> Option<String> {
     }
 }
 
+/// Windows' own processes that come to the front but are never something to set rules for.
+pub fn is_system_app(exe: &str) -> bool {
+    const SYSTEM: [&str; 10] = [
+        "explorer.exe",
+        "applicationframehost.exe",
+        "searchhost.exe",
+        "searchapp.exe",
+        "shellexperiencehost.exe",
+        "startmenuexperiencehost.exe",
+        "lockapp.exe",
+        "textinputhost.exe",
+        "systemsettings.exe",
+        "grovekeeper.exe",
+    ];
+    SYSTEM.contains(&exe)
+}
+
 pub fn resolve(config: &Config, fg: &Foreground) -> Option<Profile> {
     let rule = config.apps.iter().find(|r| !fg.exe.is_empty() && r.exe == fg.exe);
     let game = match rule.and_then(|r| r.game) {

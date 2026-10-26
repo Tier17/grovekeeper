@@ -14,14 +14,14 @@ use crate::ddc::FEATURES;
 use crate::util::{rgb, wide};
 use crate::worker::{percent, Snapshot};
 
-const BG: u32 = rgb(28, 30, 29);
-const BORDER: u32 = rgb(58, 62, 60);
-const TEXT: u32 = rgb(232, 234, 233);
-const MUTED: u32 = rgb(150, 156, 153);
-const TRACK: u32 = rgb(64, 68, 66);
-const ACCENT: u32 = rgb(108, 186, 92);
-const KNOB: u32 = rgb(240, 242, 241);
-const KNOB_ACTIVE: u32 = rgb(176, 226, 160);
+pub const BG: u32 = rgb(28, 30, 29);
+pub const BORDER: u32 = rgb(58, 62, 60);
+pub const TEXT: u32 = rgb(232, 234, 233);
+pub const MUTED: u32 = rgb(150, 156, 153);
+pub const TRACK: u32 = rgb(64, 68, 66);
+pub const ACCENT: u32 = rgb(108, 186, 92);
+pub const KNOB: u32 = rgb(240, 242, 241);
+pub const KNOB_ACTIVE: u32 = rgb(176, 226, 160);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
@@ -55,9 +55,9 @@ pub struct Layout {
 }
 
 pub struct Fonts {
-    title: HFONT,
-    normal: HFONT,
-    small: HFONT,
+    pub title: HFONT,
+    pub normal: HFONT,
+    pub small: HFONT,
 }
 
 impl Fonts {
@@ -102,11 +102,11 @@ unsafe fn font(px: f32, weight: i32) -> HFONT {
     )
 }
 
-fn rc(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+pub fn rc(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
     RECT { left, top, right, bottom }
 }
 
-fn contains(r: &RECT, x: i32, y: i32) -> bool {
+pub fn contains(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
@@ -263,13 +263,13 @@ pub unsafe fn paint(hdc: HDC, client: &RECT, lay: &Layout, fonts: &Fonts, active
     DeleteDC(mem);
 }
 
-unsafe fn fill(hdc: HDC, r: &RECT, color: u32) {
+pub unsafe fn fill(hdc: HDC, r: &RECT, color: u32) {
     let brush = CreateSolidBrush(color);
     FillRect(hdc, r, brush);
     DeleteObject(brush);
 }
 
-unsafe fn text(hdc: HDC, font: HFONT, color: u32, s: &str, r: RECT, format: u32) {
+pub unsafe fn text(hdc: HDC, font: HFONT, color: u32, s: &str, r: RECT, format: u32) {
     let old = SelectObject(hdc, font);
     SetTextColor(hdc, color);
     let mut buf: Vec<u16> = s.encode_utf16().collect();
