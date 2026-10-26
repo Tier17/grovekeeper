@@ -48,6 +48,8 @@ pub const INPUTS: [(&str, u32); 7] = [
 pub struct PhysicalMonitor {
     handle: HANDLE,
     pub name: String,
+    /// GDI device, e.g. \\.\DISPLAY1.
+    pub device: String,
 }
 
 // The handle is only ever used from the worker thread that owns it.
@@ -82,8 +84,7 @@ impl PhysicalMonitor {
     }
 }
 
-pub fn enumerate() -> Vec<PhysicalMonitor> {
-    let names = friendly_names();
+fn display_monitors() -> Vec<HMONITOR> {
     let mut hmonitors: Vec<HMONITOR> = Vec::new();
     unsafe {
         EnumDisplayMonitors(
@@ -93,9 +94,18 @@ pub fn enumerate() -> Vec<PhysicalMonitor> {
             &mut hmonitors as *mut Vec<HMONITOR> as LPARAM,
         );
     }
+    hmonitors
+}
 
+/// GDI device names of every active display, including ones without DDC/CI.
+pub fn display_devices() -> Vec<String> {
+    display_monitors().into_iter().map(gdi_device_name).filter(|d| !d.is_empty()).collect()
+}
+
+pub fn enumerate() -> Vec<PhysicalMonitor> {
+    let names = friendly_names();
     let mut out = Vec::new();
-    for hmonitor in hmonitors {
+    for hmonitor in display_monitors() {
         let device = gdi_device_name(hmonitor);
         let friendly: Vec<&String> = names
             .iter()
@@ -125,7 +135,7 @@ pub fn enumerate() -> Vec<PhysicalMonitor> {
                     }
                 }
             };
-            out.push(PhysicalMonitor { handle: pm.hPhysicalMonitor, name });
+            out.push(PhysicalMonitor { handle: pm.hPhysicalMonitor, name, device: device.clone() });
         }
     }
     out

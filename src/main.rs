@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod auto;
 mod autostart;
 mod config;
 mod ddc;
@@ -9,8 +10,10 @@ mod util;
 mod worker;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 
 use windows_sys::Win32::Foundation::{
@@ -23,7 +26,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
@@ -46,12 +50,21 @@ use worker::{from_percent, Cmd, Shared, Snapshot};
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_REFRESHED: u32 = WM_APP + 2;
+const WM_APP_FOREGROUND: u32 = WM_APP + 3;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWCP_ROUNDSMALL: i32 = 3;
 
 const TIMER_RESCAN: usize = 1;
 const TIMER_SCREENS_OFF: usize = 2;
+/// Repeating: moves the day/night schedule along and re-applies the night light,
+/// which Windows resets after some fullscreen games and display changes.
+const TIMER_SCHEDULE: usize = 3;
+/// One-shot re-checks after switching apps, because games often go fullscreen
+/// a moment after their window first appears.
+const TIMER_RECHECK_SOON: usize = 4;
+const TIMER_RECHECK_LATER: usize = 5;
+const SCHEDULE_INTERVAL_MS: u32 = 60_000;
 
 const HK_UP: i32 = 1;
 const HK_DOWN: i32 = 2;
@@ -63,6 +76,8 @@ const ID_AUTOSTART: usize = 12;
 const ID_SETTINGS: usize = 13;
 const ID_EXIT: usize = 14;
 const ID_PANEL: usize = 15;
+const ID_AUTO: usize = 16;
+const ID_TOGGLE_GAME: usize = 17;
 const ID_PRESET: usize = 100;
 const ID_MONITOR: usize = 1000;
 const MON_POWER_ON: usize = 50;
@@ -84,11 +99,105 @@ struct App {
     last_hide: u64,
     icon: HICON,
     taskbar_created: u32,
+    own_pid: u32,
+    auto: AutoState,
+}
+
+#[derive(Default)]
+struct AutoState {
+    /// Auto mode has changed something that must be undone when it is switched off.
+    active: bool,
+    /// The last real app in front; kept while focus is on the taskbar or this app.
+    foreground: Option<auto::Foreground>,
+    /// What auto mode last asked for, per monitor and feature, in percent. Auto mode only writes
+    /// when this changes, so a manual slider or hotkey change sticks until the next change.
+    last_target: HashMap<String, [Option<u32>; 3]>,
+    /// Values from before an app profile changed a setting the schedule doesn't control
+    /// (contrast, volume), put back when the profile ends.
+    saved: HashMap<String, [Option<u32>; 3]>,
+    kelvin: HashMap<String, u32>,
+    status: String,
 }
 
 impl App {
     fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(cmd);
+    }
+
+    /// Works out what every monitor should be set to right now and sends only what changed.
+    fn evaluate(&mut self, force_night_light: bool) {
+        if !self.config.auto_enabled {
+            if self.auto.active {
+                for device in ddc::display_devices() {
+                    auto::set_night_light(&device, auto::NEUTRAL_KELVIN);
+                }
+                self.auto = AutoState::default();
+            }
+            self.auto.status = "Auto off".into();
+            return;
+        }
+        self.auto.active = true;
+
+        if let Some(fg) = auto::detect_foreground(self.own_pid) {
+            self.auto.foreground = Some(fg);
+        }
+        let profile = self.auto.foreground.as_ref().and_then(|fg| auto::resolve(&self.config, fg));
+        let base = auto::schedule_at(&self.config.schedule, auto::local_minutes());
+
+        if self.view.loaded {
+            let base_values = [Some(base.brightness), base.contrast, None];
+            let mut cmds = Vec::new();
+            for (mon, m) in self.view.monitors.iter().enumerate() {
+                let key = format!("{}|{}", m.device, m.name);
+                let profile_here = profile.as_ref().filter(|p| p.device.is_empty() || p.device == m.device);
+                let last = self.auto.last_target.entry(key.clone()).or_insert([None; 3]);
+                let saved = self.auto.saved.entry(key).or_insert([None; 3]);
+                for feature in 0..FEATURES.len() {
+                    let Some(fv) = m.features[feature] else { continue };
+                    let target = profile_here.and_then(|p| p.values[feature]).or(base_values[feature]);
+                    if target == last[feature] {
+                        continue;
+                    }
+                    match target {
+                        Some(pct) => {
+                            if last[feature].is_none() && base_values[feature].is_none() {
+                                saved[feature] = Some(fv.cur);
+                            }
+                            cmds.push(Cmd::Set { mon, feature, value: from_percent(pct, fv.max) });
+                        }
+                        None => {
+                            if let Some(value) = saved[feature].take() {
+                                cmds.push(Cmd::Set { mon, feature, value });
+                            }
+                        }
+                    }
+                    last[feature] = target;
+                }
+            }
+            for cmd in cmds {
+                self.send(cmd);
+            }
+        }
+
+        for device in ddc::display_devices() {
+            let in_game = profile.as_ref().is_some_and(|p| p.game && (p.device.is_empty() || p.device == device));
+            let kelvin = if in_game && !self.config.games.night_light_in_games {
+                auto::NEUTRAL_KELVIN
+            } else {
+                base.kelvin
+            };
+            let changed = self.auto.kelvin.get(&device) != Some(&kelvin);
+            if changed || (force_night_light && kelvin < auto::NEUTRAL_KELVIN) {
+                auto::set_night_light(&device, kelvin);
+                self.auto.kelvin.insert(device, kelvin);
+            }
+        }
+
+        self.auto.status = match &profile {
+            Some(p) => p.label.clone(),
+            None if base.night => format!("Night · {}%", base.brightness),
+            None => format!("Day · {}%", base.brightness),
+        };
     }
 
     /// Updates the panel immediately and queues the DDC write.
@@ -123,6 +232,13 @@ impl App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
+
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Called by Windows whenever a different window comes to the front.
+unsafe extern "system" fn on_foreground_change(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
+    PostMessageW(MAIN_HWND.load(Ordering::Relaxed) as HWND, WM_APP_FOREGROUND, 0, 0);
 }
 
 /// Win32 calls can re-enter the window procedure, so never hold this borrow across one that
@@ -200,8 +316,23 @@ fn main() {
                 last_hide: 0,
                 icon,
                 taskbar_created,
+                own_pid: GetCurrentProcessId(),
+                auto: AutoState::default(),
             })
         });
+
+        MAIN_HWND.store(hwnd as isize, Ordering::Relaxed);
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(on_foreground_change),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        SetTimer(hwnd, TIMER_SCHEDULE, SCHEDULE_INTERVAL_MS, None);
+        with_app(|a| a.evaluate(true));
 
         add_tray(hwnd, icon);
         RegisterHotKey(hwnd, HK_UP, MOD_CONTROL | MOD_ALT, VK_UP as u32);
@@ -259,12 +390,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return false;
                 }
                 a.view = a.shared.lock().unwrap().clone();
+                a.evaluate(false);
                 true
             })
             .unwrap_or(false);
             if updated && IsWindowVisible(hwnd) != 0 {
                 place_panel(hwnd, false);
             }
+            0
+        }
+        WM_APP_FOREGROUND => {
+            with_app(|a| a.evaluate(false));
+            SetTimer(hwnd, TIMER_RECHECK_SOON, 1500, None);
+            SetTimer(hwnd, TIMER_RECHECK_LATER, 5000, None);
             0
         }
         WM_HOTKEY => {
@@ -303,7 +441,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_app(|a| {
                 if let Some(fonts) = &a.fonts {
                     let lay = ui::layout(&a.view, a.scale);
-                    ui::paint(hdc, &client, &lay, fonts, a.drag);
+                    ui::paint(hdc, &client, &lay, fonts, a.drag, &a.auto.status);
                 }
             });
             EndPaint(hwnd, &ps);
@@ -370,7 +508,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             1
         }
         WM_TIMER => {
-            KillTimer(hwnd, wparam);
+            if wparam != TIMER_SCHEDULE {
+                KillTimer(hwnd, wparam);
+            }
             match wparam {
                 TIMER_RESCAN => {
                     with_app(|a| a.send(Cmd::Rescan));
@@ -378,11 +518,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 TIMER_SCREENS_OFF => {
                     DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER as usize, 2);
                 }
+                TIMER_SCHEDULE => {
+                    with_app(|a| {
+                        a.config = Config::load();
+                        a.evaluate(true);
+                    });
+                    if IsWindowVisible(hwnd) != 0 {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
+                TIMER_RECHECK_SOON | TIMER_RECHECK_LATER => {
+                    with_app(|a| a.evaluate(false));
+                }
                 _ => {}
             }
             0
         }
         WM_DESTROY => {
+            for device in ddc::display_devices() {
+                auto::set_night_light(&device, auto::NEUTRAL_KELVIN);
+            }
             remove_tray(hwnd);
             with_app(|a| a.send(Cmd::Quit));
             PostQuitMessage(0);
@@ -488,18 +643,31 @@ unsafe fn append(menu: HMENU, flags: u32, id: usize, label: &str) {
 unsafe fn show_menu(hwnd: HWND) {
     hide_panel(hwnd);
 
-    let Some((monitors, presets)) = with_app(|a| {
+    let Some((monitors, presets, auto_on, last_app)) = with_app(|a| {
         a.config = Config::load();
         let monitors: Vec<(String, Option<u32>)> =
             a.view.monitors.iter().map(|m| (m.name.clone(), m.input)).collect();
         let presets: Vec<String> = a.config.presets.iter().map(|p| p.name.clone()).collect();
-        (monitors, presets)
+        let last_app = a
+            .auto
+            .foreground
+            .as_ref()
+            .filter(|fg| !fg.exe.is_empty())
+            .map(|fg| (fg.exe.clone(), a.config.app_is_game(&fg.exe) == Some(true)));
+        (monitors, presets, a.config.auto_enabled, last_app)
     }) else {
         return;
     };
 
     let menu = CreatePopupMenu();
     append(menu, MF_STRING, ID_PANEL, "Open panel");
+    append(menu, MF_SEPARATOR, 0, "");
+    let auto_check = if auto_on { MF_CHECKED } else { MF_UNCHECKED };
+    append(menu, MF_STRING | auto_check, ID_AUTO, "Auto mode (day/night + games)");
+    if let Some((exe, is_game)) = &last_app {
+        let check = if *is_game { MF_CHECKED } else { MF_UNCHECKED };
+        append(menu, MF_STRING | check, ID_TOGGLE_GAME, &format!("Treat {exe} as a game"));
+    }
     append(menu, MF_SEPARATOR, 0, "");
     for (i, name) in presets.iter().enumerate().take(ID_MONITOR - ID_PRESET) {
         append(menu, MF_STRING, ID_PRESET + i, name);
@@ -557,6 +725,24 @@ unsafe fn run_command(hwnd: HWND, cmd: usize) {
             SetTimer(hwnd, TIMER_SCREENS_OFF, 500, None);
         }
         ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
+        ID_AUTO => {
+            with_app(|a| {
+                config::set_value("auto", "enabled", if a.config.auto_enabled { "false" } else { "true" });
+                a.config = Config::load();
+                a.evaluate(true);
+            });
+        }
+        ID_TOGGLE_GAME => {
+            with_app(|a| {
+                let Some(exe) = a.auto.foreground.as_ref().map(|fg| fg.exe.clone()).filter(|e| !e.is_empty()) else {
+                    return;
+                };
+                let is_game = a.config.app_is_game(&exe) == Some(true);
+                config::set_value(&format!("app {exe}"), "game", if is_game { "false" } else { "true" });
+                a.config = Config::load();
+                a.evaluate(false);
+            });
+        }
         ID_SETTINGS => {
             config::ensure_exists();
             let file = wide(&config::path().to_string_lossy());

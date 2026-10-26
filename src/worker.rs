@@ -19,6 +19,7 @@ pub struct FeatureValue {
 #[derive(Clone, Debug)]
 pub struct MonitorState {
     pub name: String,
+    pub device: String,
     /// Indexed like `ddc::FEATURES`. `None` means the monitor does not support it.
     pub features: [Option<FeatureValue>; 3],
     pub input: Option<u32>,
@@ -197,6 +198,7 @@ fn read_all(monitors: &[PhysicalMonitor]) -> Vec<MonitorState> {
         .iter()
         .map(|m| MonitorState {
             name: m.name.clone(),
+            device: m.device.clone(),
             features: FEATURES.map(|(code, _)| {
                 m.get(code)
                     .filter(|&(_, max)| max > 0)

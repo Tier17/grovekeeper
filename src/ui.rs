@@ -210,7 +210,7 @@ impl Layout {
     }
 }
 
-pub unsafe fn paint(hdc: HDC, client: &RECT, lay: &Layout, fonts: &Fonts, active: Option<Target>) {
+pub unsafe fn paint(hdc: HDC, client: &RECT, lay: &Layout, fonts: &Fonts, active: Option<Target>, status: &str) {
     let (w, h) = (client.right - client.left, client.bottom - client.top);
     let mem = CreateCompatibleDC(hdc);
     let bitmap = CreateCompatibleBitmap(hdc, w, h);
@@ -224,6 +224,8 @@ pub unsafe fn paint(hdc: HDC, client: &RECT, lay: &Layout, fonts: &Fonts, active
 
     let one_line = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
     text(mem, fonts.title, TEXT, "Grovekeeper", lay.title, DT_LEFT | one_line);
+    let status_rect = RECT { left: lay.title.left + (lay.title.right - lay.title.left) / 2, ..lay.title };
+    text(mem, fonts.small, ACCENT, status, status_rect, DT_RIGHT | one_line);
     for (name, r) in &lay.headers {
         text(mem, fonts.small, MUTED, name, *r, DT_LEFT | one_line);
     }
